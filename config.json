@@ -1,0 +1,15 @@
+{
+  "imgdir": "DBDimg/",
+  "delay_degree": -3,
+  "toggle": true,
+  "keyboard_switch": true,
+  "frame_rate": 60,
+  "repair_speed": 330,
+  "heal_speed": 300,
+  "wiggle_speed": 230,
+  "press_and_release_delay": 0.003206,
+  "red_sensitive": 180,
+  "delay_pixel": -4,
+  "hyperfocus": false,
+  "focus_level": 0
+}

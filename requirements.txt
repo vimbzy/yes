@@ -1,0 +1,9 @@
+Your requirements.txt file should look like this:
+
+Plaintext
+
+numpy
+mss
+pynput
+opencv-python
+customtkinter
