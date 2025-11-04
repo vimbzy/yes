@@ -1,569 +1,341 @@
-import json
-import time
-import math
-import os
-import threading
-import numpy as np
+import cv2, numpy as np, math, time, os, threading, winsound, keyboard
+from datetime import datetime
 from mss import mss
-from pynput import keyboard
-import winsound
-import cv2
 
-class QTEBot:
+# ================= CONFIG =================
+CROP_W, CROP_H = 200, 200                          # capture window
+REGION = {
+    "left":  (2560 - CROP_W) // 2,                 # center of a 2560x1440 monitor
+    "top":   (1440 - CROP_H) // 2,
+    "width":  CROP_W,
+    "height": CROP_H,
+}
+LOG_DIR = "SCGALLERY"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+PRESS_KEY        = "space"                         # key to press on trigger
+DEBOUNCE_MS      = 50                            # min ms between presses
+EARLY_TRIGGER_S  = 0.050                          # fire this many seconds before the predicted overlap
+ANG_THRESH_DEG   = 2.0                             # visual message only (not gating)
+RING_TOL_PX      = 55                       # how close to ring radius for square
+RED_BAND_PX      = 15                             # ring band thickness where we search for red
+
+# Angular velocity sanity & smoothing
+ANG_MIN, ANG_MAX = 50.0, 700.0                     # plausible |ω| range (deg/s)
+EMA_ALPHA        = 0.35                            # smoothing for ω
+WINDOW_MIN       = 1                                # minimum samples for robust ω
+
+# Squirm targets (absolute angles)
+TARGET_ANGLES_SQUIRM = [90.0, 270.0]
+
+# ================ STATE ====================
+mode            = "overlap"   # "overlap" or "squirm"
+toggle          = True        # global run/pause
+viper_focus     = False
+focus_level     = 0           # WASD resets to 0
+delay_pixel     = 0           # kept for API parity (unused in this solver)
+last_fire_ms    = 0
+
+# ω estimator state
+_ema_omega      = None
+_last_t         = None
+_last_ang_unwrap= None
+WINDOW          = []          # (t, ang_unwrap)
+
+sct = mss()
+
+# ================ HELPERS ==================
+def beep(hz, ms):
+    try: winsound.Beep(hz, ms)
+    except: pass
+
+def grab_region(region):
+    raw = sct.grab(region)                 # BGRA
+    frame = np.array(raw, dtype=np.uint8)  # copy + dtype
+    frame = frame[:, :, :3]                # -> BGR
+    return np.ascontiguousarray(frame)     # cv2-safe layout
+
+def angle_deg(x, y, cx, cy):
+    # 0° = +x axis; increase CCW; normalize to [0, 360)
+    return (math.degrees(math.atan2(y - cy, x - cx)) + 360.0) % 360.0
+
+def ang_diff(a, b):
+    # signed shortest difference a-b in [-180, +180]
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+def _unwrap_deg(curr, prev):
+    # keep continuity across 0/360 using shortest signed diff
+    d = ang_diff(curr, prev)
+    return prev + d
+
+def effective_early_trigger():
+    # viper_focus tightens lead a bit (mimics “more focus = earlier compensation”)
+    gain = 1.0 - min(0.04 * focus_level, 0.20) if viper_focus else 1.0
+    return max(0.010, EARLY_TRIGGER_S * gain)
+
+# ================ DETECTION =================
+def detect_circle_once(gray):
+    # find the ring (one-time)
+    c = cv2.HoughCircles(
+        gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=100,
+        param1=120, param2=40,
+        minRadius=gray.shape[0]//4, maxRadius=gray.shape[0]//2
+    )
+    if c is None: return None
+    x, y, r = np.uint16(np.around(c))[0, 0]
+    return int(x), int(y), int(r)
+
+def red_line_angle(frame_bgr, cx, cy, R, band=RED_BAND_PX):
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    m1 = cv2.inRange(hsv, (0, 120, 120), (10, 255, 255))
+    m2 = cv2.inRange(hsv, (170,120,120), (180,255,255))
+    mask_red = cv2.bitwise_or(m1, m2)
+
+    H, W = mask_red.shape
+    yy, xx = np.indices((H, W))
+    rr = np.sqrt((xx - cx)**2 + (yy - cy)**2)
+    ring = ((rr > R - band) & (rr < R + band)).astype(np.uint8) * 255
+
+    mask = cv2.bitwise_and(mask_red, ring)
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0: return None
+
+    # farthest point on ring is usually the pointer tip
+    idx = np.argmax((xs - cx)**2 + (ys - cy)**2)
+    return angle_deg(xs[idx], ys[idx], cx, cy)
+
+def white_square_angle(frame_bgr, cx, cy, R, tol_px=RING_TOL_PX):
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask_w = cv2.inRange(hsv, (0, 0, 200), (180, 50, 255))
+    mask_w = cv2.morphologyEx(mask_w, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
+
+    cnts, _ = cv2.findContours(mask_w, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best, best_err = None, 1e9
+    for c in cnts:
+        if cv2.contourArea(c) < 50: continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.04 * peri, True)
+        if len(approx) != 4: continue
+        M = cv2.moments(c)
+        if M["m00"] == 0: continue
+        x = int(M["m10"] / M["m00"])
+        y = int(M["m01"] / M["m00"])
+        rad_err = abs(math.hypot(x - cx, y - cy) - R)
+        if rad_err < best_err and rad_err < tol_px:
+            best_err, best = rad_err, (x, y)
+
+    if best is None: return None
+    return angle_deg(best[0], best[1], cx, cy)
+
+# ============ ANGULAR VELOCITY (ω) ===========
+def omega_update(red_angle_deg):
     """
-    An automation bot for Quick Time Events (QTEs) in games, primarily designed for Dead by Daylight.
-    The bot captures a portion of the screen, processes it to detect visual cues for QTEs,
-    and simulates keyboard inputs to successfully complete them.
+    Returns (omega_ema_deg_per_s, omega_instant) or (None, None) until stable.
+    Adapts automatically to any speed (no fixed profiles).
     """
-    def __init__(self, config_path='config.json'):
-        """
-        Initializes the QTEBot.
+    global _ema_omega, _last_t, _last_ang_unwrap, WINDOW
 
-        Args:
-            config_path (str): The path to the configuration file.
-        """
-        self.load_config(config_path)
-        self.keyboard_controller = keyboard.Controller()
-        
-        # --- NEW: LOAD TEMPLATES ---
-        self.templates = {}
-        self.template_sizes = {}
-        
-        template_files = {
-            self.repair_speed: "repair_template.png",
-            self.heal_speed: "heal_template.png",
-            self.wiggle_speed: "wiggle_template.png"
-        }
+    t = time.perf_counter()
+    if _last_t is None:
+        _last_t = t
+        _last_ang_unwrap = red_angle_deg
+        WINDOW.clear()
+        WINDOW.append((t, red_angle_deg))
+        return None, None
 
-        for speed, file_name in template_files.items():
-            template = cv2.imread(file_name, 0) # 0 = load as grayscale
-            if template is None:
-                print(f"!!! ERROR: Could not load {file_name}")
-                self.templates[speed] = None
-                self.template_sizes[speed] = (10, 10) # Dummy size
-            else:
-                self.templates[speed] = template
-                self.template_sizes[speed] = template.shape[::-1] # (w, h)
-        # ----------------------------
-        
-        self.last_im_a = None
-        self.speed_now = self.repair_speed
-        
-        # --- Screenshot Toggle ---
-        self.save_screenshots = False  # Toggle for saving screenshots
-        
-        # --- Thread-dependant variables, moved to run() ---
-        self.sct = None
-        self.monitor = None
-        self.region = None
-        self.circle_mask = None
-        
-        # --- UPDATED: Tuned Constants ---
-        # Updated RED values based on your hsv(2, 94%, 84%)
-        self.LOWER_RED = np.array([0, 100, 100])   # H, S, V
-        self.UPPER_RED = np.array([10, 255, 255])  # H, S, V
-        
-        # --- REMOVED OLD CONSTANTS ---
-        # self.LOWER_WHITE, self.UPPER_WHITE, and the BOX_..._RATIOs 
-        # are no longer needed because we use template matching.
+    ang_unwrap = _unwrap_deg(red_angle_deg, _last_ang_unwrap)
+    dt = t - _last_t
+    if dt <= 0.0005:
+        return _ema_omega, None
 
+    inst = (ang_unwrap - _last_ang_unwrap) / dt  # deg/s, signed
+    _last_t, _last_ang_unwrap = t, ang_unwrap
 
-    def load_config(self, config_path):
-        """
-        Loads configuration from a JSON file.
-        """
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        for key, value in config.items():
-            setattr(self, key, value)
+    if abs(inst) > 3 * ANG_MAX:  # guard spikes
+        return _ema_omega, inst
 
-    def _calculate_region(self):
-        """
-        Calculates the screen region to capture based on the monitor resolution.
-        """
-        monitor_width = self.monitor['width']
-        monitor_height = self.monitor['height']
-        
-        if monitor_height == 1600: self.crop_w, self.crop_h = 250, 250
-        elif monitor_height == 1080: self.crop_w, self.crop_h = 150, 150
-        elif monitor_height == 2160: self.crop_w, self.crop_h = 330, 330
-        else: self.crop_w, self.crop_h = 200, 200
+    WINDOW.append((t, ang_unwrap))
+    if len(WINDOW) >= WINDOW_MIN:
+        t0 = WINDOW[0][0]
+        xs = np.array([w[0] - t0 for w in WINDOW])
+        ys = np.array([w[1] for w in WINDOW])
+        denom = (xs**2).sum()
+        slope = (xs * ys).sum() / denom if denom > 1e-6 else inst
+    else:
+        slope = inst
 
-        return {
-            "top": int((monitor_height - self.crop_h) / 2),
-            "left": int((monitor_width - self.crop_w) / 2),
-            "width": self.crop_w,
-            "height": self.crop_h
-        }
+    _ema_omega = slope if _ema_omega is None else (EMA_ALPHA * slope + (1 - EMA_ALPHA) * _ema_omega)
 
-    def screenshot(self):
-        """
-        Captures a screenshot and converts it directly to OpenCV's BGR format.
-        """
-        sct_img = self.sct.grab(self.region)
-        img_rgb = np.frombuffer(sct_img.rgb, dtype=np.uint8).reshape(sct_img.height, sct_img.width, 3)
-        return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    if abs(_ema_omega) < ANG_MIN * 0.4 or abs(_ema_omega) > ANG_MAX * 1.8:
+        return None, inst
 
-    def save_frame_image(self, im1):
-        """
-        Saves every screenshot taken in the main loop with a unique timestamped filename.
-        """
-        if not self.save_screenshots:
-            return
-            
-        if not os.path.exists(self.imgdir):
-            os.makedirs(self.imgdir, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        millis = int((time.time() % 1) * 1000)
-        filename = f"frame_{timestamp}_{millis:03d}.png"
-        path = os.path.join(self.imgdir, filename)
-        cv2.imwrite(path, im1)
+    return _ema_omega, inst
 
-    def save_qte_image(self, im1):
-        """
-        Saves the screenshot for every QTE attempt with a unique timestamped filename.
-        """
-        if not self.save_screenshots:
-            return
-            
-        if not os.path.exists(self.imgdir):
-            os.makedirs(self.imgdir, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        millis = int((time.time() % 1) * 1000)
-        filename = f"qte_{timestamp}_{millis:03d}.png"
-        path = os.path.join(self.imgdir, filename)
-        cv2.imwrite(path, im1)
+# ================ FIRING =====================
+def try_fire():
+    global last_fire_ms
+    now_ms = time.time() * 1000
+    if (now_ms - last_fire_ms) > DEBOUNCE_MS:
+        keyboard.press_and_release(PRESS_KEY)
+        beep(600, 60)
+        last_fire_ms = now_ms
 
-    def find_red(self, hsv_image):
-        """
-        Finds the red pixels in the image using vectorized operations.
-        Handles the "wrap-around" hue value for red in HSV.
-        """
-        # --- First red range (0-10) ---
-        # This range is set to catch H(0-10), S(150-255), V(150-255)
-        # Your value [1, 240, 214] fits perfectly in this window.
-        lower_red1 = np.array([0, 100, 100])    # H, S, V
-        upper_red1 = np.array([10, 255, 255])   # H, S, V
-        mask1 = cv2.inRange(hsv_image, lower_red1, upper_red1)
-        
-        # --- Second red range (170-179) ---
-        lower_red2 = np.array([170, 100, 100])
-        upper_red2 = np.array([179, 255, 255])
-        mask2 = cv2.inRange(hsv_image, lower_red2, upper_red2)
-        
-        # Combine the two red masks
-        color_mask = cv2.bitwise_or(mask1, mask2)
-        
-        # Apply the circle mask
-        mask = cv2.bitwise_and(color_mask, self.circle_mask)
-        target_points = np.argwhere(mask > 0)
-        
-        if target_points.size == 0:
-            return None
-            
-        r_i, r_j, max_d = self.find_thickest_point(hsv_image.shape, target_points)
-        if max_d < 1:
-            return None
-        return (r_i, r_j, max_d)
-    def find_thickest_point(self, shape, target_points):
-        """
-        Finds the thickest point in a cluster of target points.
-        """
-        target_map = np.zeros((shape[0], shape[1]), dtype=bool)
-        target_points_list = target_points.tolist()
-        for i, j in target_points_list:
-            target_map[i, j] = True
+def run_squirm(red_angle, omega_ema):
+    """Fire exactly at 90° and 270° using ω prediction, direction-agnostic."""
+    if omega_ema is None or abs(omega_ema) < ANG_MIN:
+        return
+    early = effective_early_trigger()
+    for target in TARGET_ANGLES_SQUIRM:
+        delta = ang_diff(target, red_angle)
+        t_hit = delta / omega_ema if omega_ema != 0 else 9e9
+        # if we’re within early window, lead by (t_hit - early)
+        if 0.0 <= t_hit <= (early + 0.010):
+            lead = max(0.0, t_hit - early)
+            if lead > 0: time.sleep(lead)
+            try_fire()
+            break
 
-        max_r = target_points_list[0]
-        max_d = 0
-        for i, j in target_points_list:
-            for d in range(1, 20):
-                if i + d >= shape[0] or j + d >= shape[1] or i - d < 0 or j - d < 0: break
-                if target_map[i + d, j + d] and target_map[i - d, j - d] and target_map[i - d, j + d] and target_map[i + d, j - d]:
-                    if d > max_d:
-                        max_d = d
-                        max_r = [i, j]
-                else: break
-        return (max_r[0], max_r[1], max_d)
+def run_overlap(red_angle, white_angle, omega_ema):
+    """Fire when red overlaps white using ω prediction (works at any speed)."""
+    if white_angle is None or omega_ema is None or abs(omega_ema) < ANG_MIN:
+        return
+    early = effective_early_trigger()
+    delta = ang_diff(white_angle, red_angle)
+    t_hit = delta / omega_ema if omega_ema != 0 else 9e9
+    if 0.0 <= t_hit <= (early + 0.060):
+        lead = max(0.0, t_hit - early)
+        if lead > 0: time.sleep(lead)
+        try_fire()
 
-    def find_square(self, bgr_image):
-        """
-        Finds the success zone using template matching and returns ONLY the
-        center point. This is fast, simple, and all our new logic needs.
-        """
-        
-        # --- 1. Get the correct template for the current mode ---
-        current_template = self.templates.get(self.speed_now)
-        if current_template is None:
-            return None # No template for this mode
-            
-        template_w, template_h = self.template_sizes[self.speed_now]
+# ============ KEYBOARD CONTROLS =============
+def keyboard_callback(event):
+    global toggle, mode, viper_focus, focus_level, delay_pixel
+    key = event.name.lower()
 
-        # --- 2. Prepare image ---
-        gray_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+    # F1 / CAPS: global toggle (kept to match your old UX)
+    if key == "f1" or key == "caps lock":
+        toggle = not toggle
+        beep(350 if toggle else 200, 120)
+        print(f"[toggle] running={toggle}")
+        return
 
-        # --- 3. Perform template matching ---
-        res = cv2.matchTemplate(gray_image, current_template, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-        
-        # --- 4. Process the result ---
-        print(f"Template: {self.speed_now} | Match Score: {max_val:.2f}")
+    # WASD resets focus level (old behavior)
+    if key in ("w","a","s","d"):
+        focus_level = 0
 
-        # --- 5. Check if match is good ---
-        # We use the 45% threshold from our last fix
-        if max_val > 0.45: 
-            
-            center_y = max_loc[1] + template_h // 2
-            center_x = max_loc[0] + template_w // 2
-            
-            # --- 6. MERCILESS STORM LOGIC IS GONE ---
-            # The bot is now fast enough to handle the stream 
-            # as individual skill checks.
-            
-            # --- 7. Normal Skill Check ---
-            return (center_y, center_x) # Return (row, col)
-        
-        return None # No good match found
+    # 3 = Overlap (red → white). 5 = Squirm (90° & 270°)
+    if key == "3":
+        mode = "overlap"
+        focus_level = 0
+        beep(262, 150)
+        print("[mode] OVERLAP (red→white)")
 
-    def wiggle(self, t1, deg1, direction, im1):
-        speed=self.wiggle_speed*direction
-        target1, target2 = 270, 90
-        delta_deg1 = (target1-deg1) % (direction*360)
-        delta_deg2 = (target2-deg1) % (direction*360)
-        predict_time = min(delta_deg1/speed ,delta_deg2/speed)
-        click_time = t1 + predict_time - self.press_and_release_delay + self.delay_degree/abs(speed)
-        delta_t = click_time-time.time() 
-        
-        if 0 > delta_t > -0.1:
-            self.keyboard_controller.press(keyboard.Key.space)
-            self.keyboard_controller.release(keyboard.Key.space)
-            time.sleep(0.13)
-            return 
-        try:
-            if delta_t > 0: time.sleep(delta_t)
-            self.keyboard_controller.press(keyboard.Key.space)
-            self.keyboard_controller.release(keyboard.Key.space)
-            cv2.imwrite(os.path.join(self.imgdir,'log_wiggle.png'), im1)
-            time.sleep(0.13)
-        except (ValueError, IndexError): pass
+    elif key == "5":
+        mode = "squirm"
+        focus_level = 0
+        beep(440, 150)
+        print("[mode] SQUIRM (90° & 270°)")
 
-    def timer(self, im1, t1):
-        # Save every QTE attempt image
-        self.save_qte_image(im1)
+    # 6 = Viper focus toggle (reduces early trigger a bit)
+    elif key == "6":
+        viper_focus = not viper_focus
+        beep(350 if viper_focus else 200, 150)
+        print(f"[focus] viper={viper_focus}")
 
-        if not self.toggle: return
+    # +/- keep the same prints, though not used in solver
+    elif key == "=":
+        delay_pixel += 2
+        beep(460, 100)
+        print(f"[delay_pixel] +2 → {delay_pixel}")
 
-        hsv1 = cv2.cvtColor(im1, cv2.COLOR_BGR2HSV)
-        r1 = self.find_red(hsv1)
-        if not r1: return # No needle
+    elif key == "-":
+        delay_pixel = max(0, delay_pixel - 2)
+        beep(500, 100)
+        print(f"[delay_pixel] -2 → {delay_pixel}")
 
-        deg1 = self.cal_degree(r1[0]-self.crop_h/2, r1[1]-self.crop_w/2)
-        
-        # We need a second screenshot to find the direction
-        im2 = self.screenshot()
-        hsv2 = cv2.cvtColor(im2, cv2.COLOR_BGR2HSV)
-        r2 = self.find_red(hsv2)
-        if not r2: return 
-        
-        deg2 = self.cal_degree(r2[0]-self.crop_h/2, r2[1]-self.crop_w/2)
-        if deg1 == deg2: return # Needle isn't moving
-        
-        direction = -1 if (deg2 - deg1) % 360 > 180 else 1
-        
-        # --- Handle Wiggle Separately ---
-        if self.speed_now==self.wiggle_speed:
-            return self.wiggle(t1,deg1,direction,im1)
+def start_keyboard_listener():
+    threading.Thread(target=lambda: keyboard.on_press(keyboard_callback), daemon=True).start()
+    print("[keyboard] listener active")
 
-        # --- Find Target ---
-        # Note: We pass im1, NOT hsv1
-        white_coords = self.find_square(im1)
-        if not white_coords: return # No target
+# ================= MAIN LOOP ================
+def run_system():
+    print("[system] starting…")
+    start_keyboard_listener()
 
-        # --- All Logic is Now Time-Based ---
-        try:
-            target_deg = self.cal_degree(white_coords[0]-self.crop_h/2, white_coords[1]-self.crop_w/2)
-            
-            if(self.hyperfocus):
-                speed = direction * self.speed_now * (1 + 0.04 * self.focus_level)
-            else:
-                speed = direction * self.speed_now
-            
-            if abs(speed) < 1: return # Avoid division by zero
+    circle_cached = None
+    last_log_time = 0
 
-            delta_deg = (target_deg - deg1) % (direction * 360)
-            
-            predict_time = delta_deg / speed
-            
-            # This is the core calculation
-            click_time = (t1 + predict_time 
-                          - self.press_and_release_delay 
-                          + self.delay_degree / abs(speed))
+    while True:
+        frame = grab_region(REGION)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # Calculate how long to sleep
-            delta_t = click_time - time.time()
-            
+        # One-time circle detection
+        if circle_cached is None:
+            #circle_cached = detect_circle_once(gray)
+            #if circle_cached is None:
+                #vis = frame.copy()
+                #cv2.putText(vis, "No circle found", (10, 25),
+                            #cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                #cv2.imshow("view", vis)
+                #if cv2.waitKey(1) & 0xFF == 27:
+                    #print("[system] shutting down...")
+                    #break
+                time.sleep(0.01) # Sleep a little so it doesn't spam
+                continue
 
-            # --- This is the new "hit" logic ---
-            if delta_t > 0:
-                time.sleep(delta_t)
-            
-            self.keyboard_controller.press(keyboard.Key.space)
-            self.keyboard_controller.release(keyboard.Key.space)
+        cx, cy, R = circle_cached
+        red_ang = red_line_angle(frame, cx, cy, R)
+        white_ang = white_square_angle(frame, cx, cy, R)
 
-            if(self.hyperfocus): 
-                self.focus_level = min(6, (self.focus_level + 1))
-            
-            # Optional: Add a small cooldown to prevent double-presses
-            time.sleep(0.1) 
+        # Update ω (angular velocity) using the red angle
+        omega_ema, _omega_inst = (None, None)
+        if red_ang is not None:
+            omega_ema, _omega_inst = omega_update(red_ang)
 
-        except (ValueError, IndexError, ZeroDivisionError) as e:
-            print(f"Error in timer calculation: {e}")
-            cv2.imwrite(os.path.join(self.imgdir,'log_error.png'), im1)
+        # Logic & HUD text
+        if toggle and red_ang is not None:
+            if mode == "overlap":
+                run_overlap(red_ang, white_ang, omega_ema)
+            elif mode == "squirm":
+                run_squirm(red_ang, omega_ema)
 
-    def cal_degree(self, x, y):
-        a = np.array([-1, 0])
-        b = np.array([x, y])
-        norm_b = np.linalg.norm(b)
-        if norm_b == 0: return 0
-        cos_theta = np.dot(a, b) / (np.linalg.norm(a) * norm_b)
-        degree = np.rad2deg(np.arccos(cos_theta))
-        return 360 - degree if b[1] < 0 else degree
-
-    def on_press(self, key):
-        if key == keyboard.Key.f1:
-            self.keyboard_switch = not self.keyboard_switch
-            self.toggle = self.keyboard_switch
-            winsound.Beep(350 if self.keyboard_switch else 200, 500)
-        
-        if not self.keyboard_switch: return
-
-        if key == keyboard.Key.caps_lock:
-            self.toggle = not self.toggle
-            winsound.Beep(350 if self.toggle else 200, 500)
-        
-        if not self.toggle: return
-            
-        try: k = key.char
-        except AttributeError: k = key.name
-
-        if k is None: return # Ignore keys we can't identify
-            
-        if k in 'wasd': self.focus_level = 0
-        elif k == '3': self.speed_now = self.repair_speed; winsound.Beep(262,500)
-        elif k == '4': self.speed_now = self.heal_speed; winsound.Beep(300,500)
-        elif k == '5': self.speed_now = self.wiggle_speed; winsound.Beep(440,500)
-        elif k == '6':
-            self.hyperfocus = not self.hyperfocus
-            winsound.Beep(350 if self.hyperfocus else 200, 500)
-        elif k == '7':
-            self.save_screenshots = not self.save_screenshots
-            print(f"Screenshot saving {'ENABLED' if self.save_screenshots else 'DISABLED'}")
-            winsound.Beep(600 if self.save_screenshots else 400, 300)
-        elif k == '=': self.delay_degree += 2; winsound.Beep(460,500); print(f"Delay Degree: {self.delay_degree}")
-        elif k == '-': self.delay_degree -= 2; winsound.Beep(500,500); print(f"Delay Degree: {self.delay_degree}")
-
-    def run(self):
-        if not os.path.exists(self.imgdir): os.mkdir(self.imgdir)
-        listener = keyboard.Listener(on_press=self.on_press)
-        listener.start()
-        
-        # --- MOVED INITIALIZATION HERE ---
-        # Initialize MSS and region INSIDE the bot thread
-        try:
-            self.sct = mss()
-            self.monitor = self.sct.monitors[1]
-            self.region = self._calculate_region()
-            
-            # Pre-calculate the circle mask
-            self.circle_mask = np.zeros((self.crop_h, self.crop_w), dtype=np.uint8)
-            center = (int(self.crop_w / 2), int(self.crop_h / 2))
-            radius = int(self.crop_h / 2)
-            cv2.circle(self.circle_mask, center, radius, 255, -1)
-        except Exception as e:
-            print(f"Error during bot initialization: {e}")
-            listener.stop()
-            return
-        # -----------------------------------
-
-        print("-----------------------------------------")
-        print("  QTE Bot Initialized - Ready")
-        print("-----------------------------------------")
-        print("  Hotkeys:")
-        print("    F1        : Enable/Disable Bot")
-        print("    CapsLock  : Pause/Resume Bot")
-        print("    3         : Set speed to Repair")
-        print("    4         : Set speed to Heal")
-        print("    5         : Set speed to Wiggle")
-        print("    6         : Toggle Hyperfocus Mode")
-        print("    7         : Toggle Screenshot Saving")
-        print("    = (+)     : Increase Hit Delay")
-        print("    - (-)     : Decrease Hit Delay")
-        print("-----------------------------------------")
-        print("Press F1 to enable the bot.")
-        try:
-            while True:
-                t = time.time()
-                im_array = self.screenshot()
-                self.save_frame_image(im_array)  # Save screenshot if toggled on
-                self.timer(im_array, t)
-        except KeyboardInterrupt:
-            if self.last_im_a is not None:
-                cv2.imwrite(os.path.join(self.imgdir, 'last_log.png'), self.last_im_a)
-            listener.stop()
-        except Exception as e:
-            print(f"Bot crashed during main loop: {e}")
-            if self.last_im_a is not None:
-                cv2.imwrite(os.path.join(self.imgdir, 'last_log_crash.png'), self.last_im_a)
-            listener.stop()
-
-
-# --- GUI Section ---
-import sys
-import customtkinter as ctk
-
-class BotThread(threading.Thread):
-    def __init__(self, bot):
-        super().__init__()
-        self.bot = bot
-
-    def run(self):
-        try:
-            self.bot.run()
-        except Exception as e:
-            print(f"Bot stopped: {e}")
-
-    def stop(self):
-        self.bot.toggle = False
-
-class QTEBotGUI(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-        self.title("DBD QTE Bot Controller")
-        self.geometry("400x350")
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
-
-        self.bot = None
-        self.bot_thread = None
-
-        self.status_var = ctk.StringVar(value="Bot not running")
-        self.mode_var = ctk.StringVar(value="Repair")
-        self.hyperfocus_var = ctk.BooleanVar(value=False)
-        self.delay_degree_var = ctk.IntVar(value=0)
-
-        self._build_ui()
-        self._load_config()
-        self.protocol("WM_DELETE_WINDOW", self.on_exit)
-
-    def _build_ui(self):
-        frame = ctk.CTkFrame(self, corner_radius=15)
-        frame.pack(padx=24, pady=24, fill="both", expand=True)
-
-        ctk.CTkLabel(frame, text="DBD QTE Bot", font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(10, 18))
-
-        status_row = ctk.CTkFrame(frame, fg_color="transparent")
-        status_row.pack(fill="x", pady=2)
-        ctk.CTkLabel(status_row, text="Status:", width=80, anchor="w").pack(side="left")
-        ctk.CTkLabel(status_row, textvariable=self.status_var, text_color="#1e90ff", anchor="w").pack(side="left")
-
-        mode_row = ctk.CTkFrame(frame, fg_color="transparent")
-        mode_row.pack(fill="x", pady=2)
-        ctk.CTkLabel(mode_row, text="Mode:", width=80, anchor="w").pack(side="left")
-        ctk.CTkLabel(mode_row, textvariable=self.mode_var, anchor="w").pack(side="left")
-
-        ctk.CTkLabel(frame, text="Hyperfocus:").pack(anchor="w", pady=(12, 0))
-        ctk.CTkSwitch(frame, variable=self.hyperfocus_var, text="", command=self.toggle_hyperfocus).pack(anchor="w")
-
-        ctk.CTkLabel(frame, text="Delay Degree:").pack(anchor="w", pady=(12, 0))
-        ctk.CTkSlider(frame, from_=-20, to=20, number_of_steps=40, variable=self.delay_degree_var, command=lambda v: self.update_delay_degree()).pack(fill="x", padx=10)
-
-        btn_row = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_row.pack(pady=(24, 0), fill="x")
-        self.start_btn = ctk.CTkButton(btn_row, text="Start Bot", command=self.start_bot, width=120)
-        self.start_btn.pack(side="left", padx=8)
-        self.stop_btn = ctk.CTkButton(btn_row, text="Stop Bot", command=self.stop_bot, state="disabled", width=120)
-        self.stop_btn.pack(side="left", padx=8)
-
-        ctk.CTkButton(frame, text="Exit", command=self.on_exit, fg_color="#222", hover_color="#444").pack(pady=(18, 0))
-
-        # Hotkey info
-        ctk.CTkLabel(frame, text="Hotkeys (in-game):", font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(18, 0))
-        ctk.CTkLabel(frame, text="F1: Enable/Disable | CapsLock: Pause/Resume\n3: Repair | 4: Heal | 5: Wiggle | 6: Hyperfocus\n7: Save Screenshots | = / - : Adjust Hit Delay", font=ctk.CTkFont(size=11), text_color="#aaa").pack()
-
-    def _load_config(self):
-        try:
-            with open("config.json", "r") as f:
-                config = json.load(f)
-            self.hyperfocus_var.set(config.get("hyperfocus", False))
-            self.delay_degree_var.set(config.get("delay_degree", 0))
-        except Exception:
-            pass
-
-    def _save_config(self):
-        try:
-            with open("config.json", "r") as f:
-                config = json.load(f)
-            config["hyperfocus"] = self.hyperfocus_var.get()
-            config["delay_degree"] = self.delay_degree_var.get()
-            with open("config.json", "w") as f:
-                json.dump(config, f, indent=2)
-        except Exception:
-            pass
-
-    def start_bot(self):
-        if self.bot_thread and self.bot_thread.is_alive():
-            return
-        self._save_config()
-        self.bot = QTEBot()
-        self.bot.hyperfocus = self.hyperfocus_var.get()
-        self.bot.delay_degree = self.delay_degree_var.get()
-        self.bot.toggle = True
-        self.bot_thread = BotThread(self.bot)
-        self.bot_thread.daemon = True
-        self.bot_thread.start()
-        self.status_var.set("Bot running")
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.update_mode_label()
-
-    def stop_bot(self):
-        if self.bot:
-            self.bot.toggle = False
-        if self.bot_thread:
-            self.bot_thread.stop()
-        self.status_var.set("Bot stopped")
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-
-    def update_mode_label(self):
-        if not self.bot:
-            self.mode_var.set("Repair")
-            return
-        speed = getattr(self.bot, "speed_now", self.bot.repair_speed)
-        if speed == self.bot.repair_speed:
-            self.mode_var.set("Repair")
-        elif speed == self.bot.heal_speed:
-            self.mode_var.set("Heal")
-        elif speed == self.bot.wiggle_speed:
-            self.mode_var.set("Wiggle")
+            txt = f"Red:{red_ang:6.1f}"
+            if white_ang is not None:
+                txt += f"  White:{white_ang:6.1f}"
+            if omega_ema is not None:
+                txt += f"  ω:{omega_ema:6.1f}°/s"
+            cv2.putText(frame, txt, (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         else:
-            self.mode_var.set("Custom")
+            msg = "[PAUSED]" if not toggle else "[NO DETECTION]"
+            cv2.putText(frame, msg, (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    def toggle_hyperfocus(self):
-        if self.bot:
-            self.bot.hyperfocus = self.hyperfocus_var.get()
-        self._save_config()
+        # Ring outline
+        cv2.circle(frame, (cx, cy), R, (255, 0, 0), 1)
 
-    def update_delay_degree(self):
-            if self.bot:
-                self.bot.delay_degree = self.delay_degree_var.get()
-            self._save_config()
+        # Overlays only when angles exist (0.0 is valid!)
+        if red_ang is not None:
+            rx = int(cx + R * math.cos(math.radians(red_ang)))
+            ry = int(cy + R * math.sin(math.radians(red_ang)))
+            cv2.line(frame, (cx, cy), (rx, ry), (0, 0, 255), 2)
 
-    def on_exit(self):
-        self.stop_bot()
-        self.destroy()
-        sys.exit(0)
+        if white_ang is not None:
+            wx = int(cx + R * math.cos(math.radians(white_ang)))
+            wy = int(cy + R * math.sin(math.radians(white_ang)))
+            cv2.circle(frame, (wx, wy), 5, (255, 255, 255), -1)
+
+        # Show frame
+        # Resize for display only (makes the window 2x bigger)
+        #display_frame = cv2.resize(frame, (CROP_W * 2, CROP_H * 2), interpolation=cv2.INTER_NEAREST)
+        #cv2.imshow("view", display_frame)
+        #cv2.imshow("view", frame)
+        #if cv2.waitKey(1) & 0xFF == 27:
+            #print("[system] shutting down...")
+            #break
+            time.sleep(0.001)
+
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    app = QTEBotGUI()
-    app.mainloop()
+    run_system()
