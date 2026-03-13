@@ -5,6 +5,7 @@ import time
 import os
 import threading
 import keyboard
+from collections import deque
 from datetime import datetime
 from mss import mss
 from ultralytics import YOLO
@@ -88,6 +89,7 @@ last_fire_ms = 0
 _last_white_ang = None
 _last_white_ang_t = 0.0
 _last_red_unwrap = None
+_white_history: deque = deque(maxlen=5)
 sct = mss()
 
 # ================= CORE =================
@@ -97,9 +99,7 @@ def try_fire():
     now_ms = time.time() * 1000
     if now_ms - last_fire_ms > DEBOUNCE_MS:
         logging.info(f"*** FIRE! (Δ={now_ms - last_fire_ms:.0f}ms) ***")
-        keyboard.press(PRESS_KEY)
-        time.sleep(0.015)
-        keyboard.release(PRESS_KEY)
+        keyboard.press_and_release(PRESS_KEY)
         last_fire_ms = now_ms
 
 def keyboard_callback(event):
@@ -116,7 +116,7 @@ def start_keyboard_listener():
 def run_system():
     print("[system] starting main loop…")
     start_keyboard_listener()
-    global _last_white_ang, _last_white_ang_t, _last_red_unwrap
+    global _last_white_ang, _last_white_ang_t, _last_red_unwrap, _white_history
 
     # Window setup
     cv2.namedWindow("view", cv2.WINDOW_NORMAL)
@@ -125,8 +125,6 @@ def run_system():
 
     while True:
         loop_start = time.perf_counter()
-        if not hasattr(run_system, "_white_history"):
-            run_system._white_history = []
 
         # grab frame
         frame = grab_region(REGION)
@@ -163,21 +161,17 @@ def run_system():
 
         if detected_white_ang is not None:
             _last_white_ang, _last_white_ang_t = detected_white_ang, t_now
-            run_system._white_history.append(detected_white_ang)
-            if len(run_system._white_history) > 5:  # keep last 5 frames
-                run_system._white_history.pop(0)
+            _white_history.append(detected_white_ang)
         elif _last_white_ang is not None and (t_now - _last_white_ang_t < WHITE_ANG_MEMORY_S):
-            run_system._white_history.append(_last_white_ang)
-            if len(run_system._white_history) > 5:
-                run_system._white_history.pop(0)
+            _white_history.append(_last_white_ang)
         else:
             detected_white_ang = None
             _last_white_ang = None
-            run_system._white_history.clear()
+            _white_history.clear()
 
         # smooth using recent history
-        if run_system._white_history:
-            detected_white_ang = float(np.mean(run_system._white_history))
+        if _white_history:
+            detected_white_ang = float(np.mean(_white_history))
         # -----------------------------------------
 
         # unwrap red angle
@@ -193,7 +187,7 @@ def run_system():
 
         # --- FIRE CONDITION (improved) ---
         if toggle and red_ang_unwrap is not None and detected_white_ang is not None:
-            diff = abs((red_ang_unwrap - detected_white_ang) % 360)
+            diff = (red_ang_unwrap - detected_white_ang) % 360
             if diff > 180:
                 diff = 360 - diff
 
