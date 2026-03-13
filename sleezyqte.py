@@ -1,4 +1,5 @@
 import cv2, numpy as np, math, time, os, threading, winsound, keyboard
+from collections import deque
 from datetime import datetime
 from mss import mss
 
@@ -23,7 +24,8 @@ RED_BAND_PX      = 15                             # ring band thickness where we
 # Angular velocity sanity & smoothing
 ANG_MIN, ANG_MAX = 50.0, 700.0                     # plausible |ω| range (deg/s)
 EMA_ALPHA        = 0.35                            # smoothing for ω
-WINDOW_MIN       = 1                                # minimum samples for robust ω
+WINDOW_MIN       = 1                               # minimum samples for robust ω
+WINDOW_MAX       = 30                              # sliding window cap for ω regression
 
 # Squirm targets (absolute angles)
 TARGET_ANGLES_SQUIRM = [90.0, 270.0]
@@ -40,7 +42,7 @@ last_fire_ms    = 0
 _ema_omega      = None
 _last_t         = None
 _last_ang_unwrap= None
-WINDOW          = []          # (t, ang_unwrap)
+WINDOW          = deque(maxlen=WINDOW_MAX)  # (t, ang_unwrap)
 
 sct = mss()
 
@@ -85,14 +87,15 @@ def detect_circle_once(gray):
     x, y, r = np.uint16(np.around(c))[0, 0]
     return int(x), int(y), int(r)
 
-def red_line_angle(frame_bgr, cx, cy, R, band=RED_BAND_PX):
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+def red_line_angle(frame_bgr, cx, cy, R, band=RED_BAND_PX, hsv=None):
+    if hsv is None:
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     m1 = cv2.inRange(hsv, (0, 120, 120), (10, 255, 255))
     m2 = cv2.inRange(hsv, (170,120,120), (180,255,255))
     mask_red = cv2.bitwise_or(m1, m2)
 
     H, W = mask_red.shape
-    yy, xx = np.indices((H, W))
+    yy, xx = np.ogrid[:H, :W]                     # open mesh – much less memory than np.indices
     rr = np.sqrt((xx - cx)**2 + (yy - cy)**2)
     ring = ((rr > R - band) & (rr < R + band)).astype(np.uint8) * 255
 
@@ -104,8 +107,9 @@ def red_line_angle(frame_bgr, cx, cy, R, band=RED_BAND_PX):
     idx = np.argmax((xs - cx)**2 + (ys - cy)**2)
     return angle_deg(xs[idx], ys[idx], cx, cy)
 
-def white_square_angle(frame_bgr, cx, cy, R, tol_px=RING_TOL_PX):
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+def white_square_angle(frame_bgr, cx, cy, R, tol_px=RING_TOL_PX, hsv=None):
+    if hsv is None:
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     mask_w = cv2.inRange(hsv, (0, 0, 200), (180, 50, 255))
     mask_w = cv2.morphologyEx(mask_w, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
 
@@ -263,29 +267,38 @@ def run_system():
     start_keyboard_listener()
 
     circle_cached = None
-    last_log_time = 0
+    frame_count = 0
+    CIRCLE_REDETECT_INTERVAL = 30          # re-check circle every N frames
+
+    cv2.namedWindow("view", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("view", CROP_W * 4, CROP_H * 4)
 
     while True:
         frame = grab_region(REGION)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_count += 1
 
-        # One-time circle detection
-        if circle_cached is None:
-            #circle_cached = detect_circle_once(gray)
-            #if circle_cached is None:
-                #vis = frame.copy()
-                #cv2.putText(vis, "No circle found", (10, 25),
-                            #cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                #cv2.imshow("view", vis)
-                #if cv2.waitKey(1) & 0xFF == 27:
-                    #print("[system] shutting down...")
-                    #break
-                time.sleep(0.01) # Sleep a little so it doesn't spam
+        # Detect circle once, then refresh periodically for robustness
+        if circle_cached is None or frame_count % CIRCLE_REDETECT_INTERVAL == 0:
+            result = detect_circle_once(gray)
+            if result is not None:
+                circle_cached = result
+            elif circle_cached is None:
+                vis = frame.copy()
+                cv2.putText(vis, "No circle found", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.imshow("view", vis)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    print("[system] shutting down...")
+                    break
                 continue
 
         cx, cy, R = circle_cached
-        red_ang = red_line_angle(frame, cx, cy, R)
-        white_ang = white_square_angle(frame, cx, cy, R)
+
+        # Compute HSV once per frame – shared by both detectors
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        red_ang   = red_line_angle(frame, cx, cy, R, hsv=hsv)
+        white_ang = white_square_angle(frame, cx, cy, R, hsv=hsv)
 
         # Update ω (angular velocity) using the red angle
         omega_ema, _omega_inst = (None, None)
@@ -325,15 +338,13 @@ def run_system():
             wy = int(cy + R * math.sin(math.radians(white_ang)))
             cv2.circle(frame, (wx, wy), 5, (255, 255, 255), -1)
 
-        # Show frame
-        # Resize for display only (makes the window 2x bigger)
-        #display_frame = cv2.resize(frame, (CROP_W * 2, CROP_H * 2), interpolation=cv2.INTER_NEAREST)
-        #cv2.imshow("view", display_frame)
-        #cv2.imshow("view", frame)
-        #if cv2.waitKey(1) & 0xFF == 27:
-            #print("[system] shutting down...")
-            #break
-            time.sleep(0.001)
+        # Show frame (resize for visibility)
+        display_frame = cv2.resize(frame, (CROP_W * 4, CROP_H * 4),
+                                   interpolation=cv2.INTER_NEAREST)
+        cv2.imshow("view", display_frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            print("[system] shutting down...")
+            break
 
     cv2.destroyAllWindows()
 
